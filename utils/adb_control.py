@@ -4,6 +4,7 @@ from pathlib import Path
 from time import sleep
 
 import cv2
+import numpy as np
 
 from config import ADB_SERIAL, DEFAULT_SCREENSHOT_NAME, SCREENSHOT_DIR
 from utils.logger import get_logger
@@ -39,13 +40,10 @@ class AdbController:
 
     def _run(self, args: list[str], *, device: bool = True, check: bool = True) -> subprocess.CompletedProcess[str]:
         ''' 执行 adb 命令，自动添加设备参数。 '''
-        command = ["adb"]
-        if device:
-            command.extend(["-s", self.serial])
-        command.extend(args)
+        command = self._build_command(args, device=device)
 
         logger.debug("执行 adb 命令: %s", " ".join(command))
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True, errors="replace")
         if check and device and result.returncode != 0 and self._is_recoverable_adb_error(result):
             logger.warning(
                 "ADB 连接异常，正在重连并重试: command=%s stdout=%r stderr=%r",
@@ -54,7 +52,7 @@ class AdbController:
                 _limit_text(result.stderr),
             )
             self._recover_connection()
-            result = subprocess.run(command, capture_output=True, text=True)
+            result = subprocess.run(command, capture_output=True, text=True, errors="replace")
 
         if check and result.returncode != 0:
             logger.error(
@@ -66,6 +64,48 @@ class AdbController:
             )
             raise AdbCommandError(command, result)
         return result
+
+    def _run_binary(
+        self,
+        args: list[str],
+        *,
+        device: bool = True,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[bytes]:
+        """执行返回二进制数据的 adb 命令，保留连接恢复和错误检查。"""
+        command = self._build_command(args, device=device)
+        logger.debug("执行 adb 二进制命令: %s", " ".join(command))
+        result = subprocess.run(command, capture_output=True)
+        text_result = _binary_result_to_text(result)
+
+        if check and device and result.returncode != 0 and self._is_recoverable_adb_error(text_result):
+            logger.warning(
+                "ADB 连接异常，正在重连并重试: command=%s stdout=%r stderr=%r",
+                " ".join(command),
+                _limit_text(text_result.stdout),
+                _limit_text(text_result.stderr),
+            )
+            self._recover_connection()
+            result = subprocess.run(command, capture_output=True)
+            text_result = _binary_result_to_text(result)
+
+        if check and result.returncode != 0:
+            logger.error(
+                "adb 命令失败: command=%s returncode=%s stdout=%r stderr=%r",
+                " ".join(command),
+                result.returncode,
+                _limit_text(text_result.stdout),
+                _limit_text(text_result.stderr),
+            )
+            raise AdbCommandError(command, text_result)
+        return result
+
+    def _build_command(self, args: list[str], *, device: bool) -> list[str]:
+        command = ["adb"]
+        if device:
+            command.extend(["-s", self.serial])
+        command.extend(args)
+        return command
 
     @property
     def ip(self) -> str:
@@ -90,22 +130,55 @@ class AdbController:
     def take_screenshot(self, output_path: str | Path | None = None) -> Path:
         """使用 adb 截图并保存到本地，返回截图路径。"""
         path = Path(output_path) if output_path else SCREENSHOT_DIR / DEFAULT_SCREENSHOT_NAME
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        remote_path = "/sdcard/_bbma_screen.png"
-        self._run(["shell", "screencap", "-p", remote_path])
-        self._run(["pull", remote_path, str(path)])
+        screen = self._capture_screenshot()
+        self._write_screenshot(path, screen)
         logger.info("截图已保存: %s", path)
         return path
 
     def read_screenshot(self, output_path: str | Path | None = None):
-        """截图并读取为 OpenCV 图像对象。"""
-        path = self.take_screenshot(output_path)
+        """截图并读取为 OpenCV 图像；仅在指定路径时写入磁盘。"""
+        screen = self._capture_screenshot()
+        if output_path is not None:
+            path = Path(output_path)
+            self._write_screenshot(path, screen)
+            logger.info("截图已保存: %s", path)
+        return screen
+
+    def _capture_screenshot(self):
+        """优先通过 exec-out 在内存中获取截图，不产生轮询临时文件。"""
+        try:
+            result = self._run_binary(["exec-out", "screencap", "-p"])
+            screen = cv2.imdecode(np.frombuffer(result.stdout, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if screen is not None:
+                return screen
+            logger.warning("adb exec-out 截图解码失败，回退到临时文件截图")
+        except AdbCommandError as exc:
+            logger.warning("adb exec-out 截图失败，回退到临时文件截图: %s", exc)
+
+        return self._capture_screenshot_legacy()
+
+    def _capture_screenshot_legacy(self):
+        """兼容不支持 exec-out 的 adb，使用设备临时文件截图。"""
+        path = SCREENSHOT_DIR / DEFAULT_SCREENSHOT_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        remote_path = "/sdcard/_bbma_screen.png"
+        self._run(["shell", "screencap", "-p", remote_path])
+        self._run(["pull", remote_path, str(path)])
         screen = cv2.imread(str(path))
         if screen is None:
             logger.error("截图读取失败: %s", path)
             raise RuntimeError(f"failed to read screenshot: {path}")
         return screen
+
+    @staticmethod
+    def _write_screenshot(path: Path, screen) -> None:
+        """以 PNG 等无损格式保存截图，并兼容中文路径。"""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        suffix = path.suffix or ".png"
+        ok, encoded = cv2.imencode(suffix, screen)
+        if not ok:
+            raise RuntimeError(f"failed to encode screenshot: {path}")
+        encoded.tofile(str(path))
 
     def is_landscape_by_screenshot(self) -> bool:
         """根据截图判断屏幕是否为横屏。"""
@@ -421,7 +494,7 @@ class AdbController:
         self._root_shell_ready = False
         disconnect_command = ["adb", "disconnect", self.serial]
         logger.info("断开 adb 设备连接: %s", self.serial)
-        subprocess.run(disconnect_command, capture_output=True, text=True)
+        subprocess.run(disconnect_command, capture_output=True, text=True, errors="replace")
         sleep(0.5)
         self.connect()
         sleep(1.0)
@@ -645,6 +718,18 @@ def _limit_text(text: str, limit: int = 500) -> str:
     if len(stripped) <= limit:
         return stripped
     return stripped[:limit] + "...(truncated)"
+
+
+def _binary_result_to_text(
+    result: subprocess.CompletedProcess[bytes],
+) -> subprocess.CompletedProcess[str]:
+    """仅为错误判断解码二进制命令输出，不改动原始 stdout。"""
+    return subprocess.CompletedProcess(
+        args=result.args,
+        returncode=result.returncode,
+        stdout=result.stdout.decode("utf-8", errors="replace"),
+        stderr=result.stderr.decode("utf-8", errors="replace"),
+    )
 
 
 def _build_weak_network_script(command: str, uid: int, enabled: bool) -> str:

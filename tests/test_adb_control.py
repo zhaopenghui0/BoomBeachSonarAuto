@@ -1,6 +1,11 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import cv2
+import numpy as np
 
 from utils.adb_control import AdbController
 
@@ -43,6 +48,56 @@ class AdbNetworkStateTests(unittest.TestCase):
             "ip6tables -C OUTPUT -m owner --uid-owner 10051 -j BBMA_REJECTNET",
             check=False,
         )
+
+
+class AdbScreenshotTests(unittest.TestCase):
+    def setUp(self):
+        self.adb = AdbController(auto_connect=False)
+        self.image = np.zeros((12, 18, 3), dtype=np.uint8)
+        self.image[:, :, 1] = 127
+        ok, encoded = cv2.imencode(".png", self.image)
+        self.assertTrue(ok)
+        self.png_bytes = encoded.tobytes()
+
+    def test_read_screenshot_uses_exec_out_without_writing_file(self):
+        result = SimpleNamespace(stdout=self.png_bytes)
+        with (
+            patch.object(self.adb, "_run_binary", return_value=result) as run_binary,
+            patch.object(self.adb, "_write_screenshot") as write_screenshot,
+        ):
+            actual = self.adb.read_screenshot()
+
+        run_binary.assert_called_once_with(["exec-out", "screencap", "-p"])
+        write_screenshot.assert_not_called()
+        np.testing.assert_array_equal(actual, self.image)
+
+    def test_read_screenshot_saves_only_when_output_path_is_requested(self):
+        result = SimpleNamespace(stdout=self.png_bytes)
+        with TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "截图.png"
+            with patch.object(self.adb, "_run_binary", return_value=result):
+                actual = self.adb.read_screenshot(path)
+
+            self.assertTrue(path.exists())
+            saved = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+
+        np.testing.assert_array_equal(actual, self.image)
+        np.testing.assert_array_equal(saved, self.image)
+
+    def test_invalid_exec_out_image_falls_back_to_legacy_capture(self):
+        result = SimpleNamespace(stdout=b"not a png")
+        with (
+            patch.object(self.adb, "_run_binary", return_value=result),
+            patch.object(
+                self.adb,
+                "_capture_screenshot_legacy",
+                return_value=self.image,
+            ) as legacy,
+        ):
+            actual = self.adb.read_screenshot()
+
+        legacy.assert_called_once_with()
+        np.testing.assert_array_equal(actual, self.image)
 
 
 if __name__ == "__main__":

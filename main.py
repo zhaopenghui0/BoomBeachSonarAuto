@@ -4,6 +4,7 @@ from pathlib import Path
 from time import monotonic, sleep
 
 import numpy as np
+import cv2
 
 from config import (
     GAME_PACKAGE_NAME,
@@ -43,6 +44,7 @@ RETRY_TEMPLATE = TEMPLATE_DIR / "retry.png"
 ACTIVITY_DETAIL_POINT = (1205, 644)
 ACTIVITY_LIST_SWIPE = (1000, 660, 1000, 180)
 RUN_DEBUG_DIR = SCREENSHOT_DIR / "run_debug"
+SAVED_GRID_MAX_CORNER_ERROR_RATIO = 0.05
 
 _weak_network_cleanup_done = False
 _active_probe: "ProbeTransaction | None" = None
@@ -220,13 +222,104 @@ def get_click_points(
             logger.warning("读取第 %s 关人工点位失败，回退自动识别：%s", level, exc)
         else:
             if saved_points is not None and saved_quad is not None:
-                logger.info("第 %s 关使用人工校准点位：%s 个", level, len(saved_points))
-                return saved_points, saved_quad
+                try:
+                    detected = detect_diamond_centers(grid_img, grid_size)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"无法验证第 {level} 关人工点位；为避免误点已中止探测"
+                    ) from exc
+
+                if _saved_grid_matches_current(saved_quad, detected.global_quad, grid_img.shape):
+                    _validate_click_points(
+                        saved_points,
+                        detected.global_quad,
+                        grid_img.shape,
+                        expected_count=grid_size * grid_size,
+                    )
+                    logger.info("第 %s 关使用人工校准点位：%s 个", level, len(saved_points))
+                    return saved_points, saved_quad
+
+                corner_errors = np.linalg.norm(saved_quad - detected.global_quad, axis=1)
+                logger.warning(
+                    "第 %s 关人工点位与当前画面不匹配，最大角点偏差 %.1f px，"
+                    "改用当前画面自动识别的 %s 个点位",
+                    level,
+                    float(np.max(corner_errors)),
+                    len(detected.points),
+                )
+                _validate_click_points(
+                    detected.points,
+                    detected.global_quad,
+                    grid_img.shape,
+                    expected_count=grid_size * grid_size,
+                )
+                return detected.points, detected.global_quad
             logger.warning("第 %s 关人工点位不存在或数量不正确，回退自动识别", level)
 
     grid_result = detect_diamond_centers(grid_img, grid_size)
+    _validate_click_points(
+        grid_result.points,
+        grid_result.global_quad,
+        grid_img.shape,
+        expected_count=grid_size * grid_size,
+    )
     logger.info("第 %s 关使用自动识别点位：%s 个", level, len(grid_result.points))
     return grid_result.points, grid_result.global_quad
+
+
+def _saved_grid_matches_current(
+    saved_quad: np.ndarray,
+    detected_quad: np.ndarray,
+    image_shape: tuple[int, ...],
+) -> bool:
+    """判断保存的网格四角是否仍与当前画面位置一致。"""
+    saved = np.asarray(saved_quad, dtype=np.float32)
+    detected = np.asarray(detected_quad, dtype=np.float32)
+    if saved.shape != (4, 2) or detected.shape != (4, 2) or len(image_shape) < 2:
+        return False
+
+    height, width = image_shape[:2]
+    image_diagonal = float(np.hypot(width, height))
+    max_error = max(20.0, image_diagonal * SAVED_GRID_MAX_CORNER_ERROR_RATIO)
+    corner_errors = np.linalg.norm(saved - detected, axis=1)
+    return bool(np.all(corner_errors <= max_error))
+
+
+def _validate_click_points(
+    points: list[tuple[int, int]],
+    grid_quad: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    expected_count: int,
+) -> None:
+    """确保所有点击点都位于当前截图的白色网格边界内。"""
+    if len(points) != expected_count:
+        raise RuntimeError(
+            f"网格点击点数量异常：expected={expected_count} actual={len(points)}"
+        )
+    if len(set(points)) != len(points):
+        raise RuntimeError("网格点击点包含重复坐标；为避免重复点击已中止探测")
+    if len(image_shape) < 2:
+        raise RuntimeError(f"截图尺寸异常：{image_shape}")
+
+    height, width = image_shape[:2]
+    contour = np.asarray(grid_quad, dtype=np.float32).reshape((-1, 1, 2))
+    if contour.shape != (4, 1, 2):
+        raise RuntimeError(f"网格边界格式异常：{contour.shape}")
+
+    invalid_points = []
+    for x, y in points:
+        in_image = 0 <= x < width and 0 <= y < height
+        in_grid = cv2.pointPolygonTest(contour, (float(x), float(y)), False) >= 0
+        if not in_image or not in_grid:
+            invalid_points.append((x, y))
+
+    if invalid_points:
+        preview = invalid_points[:5]
+        raise RuntimeError(
+            f"检测到 {len(invalid_points)} 个点击点位于当前白色网格外：{preview}；"
+            "为避免误点已中止探测"
+        )
 
 
 def handle_game_level(
@@ -389,7 +482,9 @@ def _scan_level_by_strategy(
             )
 
     if not strategy.done:
-        known_cells = set(strategy.shots) | strategy.blocked_cells
+        # blocked_cells 只是策略推断的安全区，并没有真实探测结果。策略未能
+        # 完成时必须重新纳入兜底扫描，避免把错误推断当成已验证结果。
+        known_cells = set(strategy.shots)
         _scan_level_by_grid_order(
             level,
             hit_map,
@@ -652,7 +747,7 @@ def main(level: int) -> Path | None:
 
 if __name__ == "__main__":
     register_exit_cleanup()
-    level = 2
+    level = 11
     try:
         adb.ensure_root_shell()
         cleanup_reject_network("主流程启动")

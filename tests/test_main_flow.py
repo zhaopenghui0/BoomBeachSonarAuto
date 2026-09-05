@@ -1,7 +1,10 @@
 import importlib
 import sys
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import numpy as np
 
 
 class FakeAdb:
@@ -330,6 +333,124 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(execute.call_count, 2)
         self.assertEqual(execute.call_args_list[0], execute.call_args_list[1])
         recover.assert_called_once_with()
+
+    def test_saved_grid_validation_accepts_small_corner_drift(self):
+        saved = np.array([[100, 10], [200, 100], [100, 200], [10, 100]])
+        detected = saved + np.array([[2, -1], [1, 2], [-2, 1], [-1, -2]])
+
+        self.assertTrue(
+            self.main._saved_grid_matches_current(saved, detected, (720, 1280, 3))
+        )
+
+    def test_saved_grid_validation_rejects_stale_points(self):
+        saved = np.array([[664, 48], [1069, 288], [671, 625], [259, 290]])
+        detected = np.array([[668, 148], [930, 315], [656, 539], [502, 239]])
+
+        self.assertFalse(
+            self.main._saved_grid_matches_current(saved, detected, (720, 1280, 3))
+        )
+
+    def test_click_point_validation_accepts_points_inside_current_grid(self):
+        quad = np.array([[10, 0], [20, 10], [10, 20], [0, 10]])
+        points = [(10, 4), (16, 10), (10, 16), (4, 10)]
+
+        self.main._validate_click_points(
+            points,
+            quad,
+            (30, 30, 3),
+            expected_count=4,
+        )
+
+    def test_click_point_validation_rejects_point_outside_current_grid(self):
+        quad = np.array([[10, 0], [20, 10], [10, 20], [0, 10]])
+        points = [(10, 4), (16, 10), (10, 16), (29, 29)]
+
+        with self.assertRaisesRegex(RuntimeError, "白色网格外"):
+            self.main._validate_click_points(
+                points,
+                quad,
+                (30, 30, 3),
+                expected_count=4,
+            )
+
+    def test_click_point_validation_rejects_duplicate_coordinates(self):
+        quad = np.array([[10, 0], [20, 10], [10, 20], [0, 10]])
+        points = [(10, 4), (16, 10), (10, 16), (10, 16)]
+
+        with self.assertRaisesRegex(RuntimeError, "重复坐标"):
+            self.main._validate_click_points(
+                points,
+                quad,
+                (30, 30, 3),
+                expected_count=4,
+            )
+
+    def test_get_click_points_replaces_stale_saved_points(self):
+        saved_points = [(0, 0)] * 100
+        saved_quad = np.array([[664, 48], [1069, 288], [671, 625], [259, 290]])
+        detected_points = [
+            (655 + (col - row) * 10, 230 + (row + col) * 10)
+            for row in range(10)
+            for col in range(10)
+        ]
+        detected_quad = np.array([[653, 148], [930, 311], [663, 539], [383, 315]])
+        detected = SimpleNamespace(points=detected_points, global_quad=detected_quad)
+        grid_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        with (
+            patch.object(self.main, "read_saved_points", return_value=saved_points),
+            patch.object(self.main, "read_saved_quad", return_value=saved_quad),
+            patch.object(self.main, "detect_diamond_centers", return_value=detected),
+        ):
+            points, quad = self.main.get_click_points(9, grid_img)
+
+        self.assertEqual(points, detected_points)
+        np.testing.assert_array_equal(quad, detected_quad)
+
+    def test_get_click_points_stops_when_saved_points_cannot_be_verified(self):
+        saved_points = [(0, 0)] * 100
+        saved_quad = np.array([[664, 48], [1069, 288], [671, 625], [259, 290]])
+        grid_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        with (
+            patch.object(self.main, "read_saved_points", return_value=saved_points),
+            patch.object(self.main, "read_saved_quad", return_value=saved_quad),
+            patch.object(
+                self.main,
+                "detect_diamond_centers",
+                side_effect=ValueError("grid not found"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "为避免误点已中止探测"):
+                self.main.get_click_points(9, grid_img)
+
+    def test_strategy_fallback_does_not_skip_inferred_safety_area(self):
+        strategy = SimpleNamespace(
+            done=False,
+            shots={(0, 0): False},
+            blocked_cells={(0, 1), (1, 0)},
+            choose_next_cell=lambda: None,
+            get_confirmed_ships=lambda: [],
+        )
+        progress_bar = MagicMock()
+        progress_context = MagicMock()
+        progress_context.__enter__.return_value = progress_bar
+
+        with (
+            patch.object(self.main, "SubmarineStrategy", return_value=strategy),
+            patch.object(self.main, "fixed_progress_bar", return_value=progress_context),
+            patch.object(self.main, "update_fixed_progress"),
+            patch.object(self.main, "_scan_level_by_grid_order") as fallback,
+        ):
+            self.main._scan_level_by_strategy(
+                level=1,
+                hit_map=[[0, 0, 0] for _ in range(3)],
+                click_points=[(0, 0)] * 9,
+                submarines=[3],
+            )
+
+        fallback.assert_called_once()
+        self.assertEqual(fallback.call_args.kwargs["skip_cells"], {(0, 0)})
 
 
 if __name__ == "__main__":
