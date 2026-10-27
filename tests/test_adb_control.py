@@ -1,3 +1,4 @@
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,7 +8,29 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from utils.adb_control import AdbController
+from utils.adb_control import AdbController, resolve_adb_executable
+
+
+class AdbExecutableTests(unittest.TestCase):
+    def test_uses_adb_path_override(self):
+        with TemporaryDirectory() as temp_dir:
+            adb_path = Path(temp_dir) / "adb.exe"
+            adb_path.touch()
+            with patch.dict(os.environ, {"ADB_PATH": str(adb_path)}):
+                self.assertEqual(resolve_adb_executable(), str(adb_path))
+
+    def test_rejects_missing_adb_path_override(self):
+        missing = str(Path("missing") / "adb.exe")
+        with patch.dict(os.environ, {"ADB_PATH": missing}):
+            with self.assertRaisesRegex(FileNotFoundError, "ADB_PATH"):
+                resolve_adb_executable()
+
+    def test_controller_uses_explicit_adb_executable(self):
+        adb = AdbController(auto_connect=False, adb_executable=r"C:\tools\adb.exe")
+        self.assertEqual(
+            adb._build_command(["devices"], device=False),
+            [r"C:\tools\adb.exe", "devices"],
+        )
 
 
 class AdbNetworkStateTests(unittest.TestCase):

@@ -3,12 +3,15 @@ Add-Type -AssemblyName System.Drawing
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$DataRoot = if ($env:BBMA_DATA_DIR) { $env:BBMA_DATA_DIR } else { $ProjectRoot }
+$BundledRunner = $env:BBMA_WORKER_PATH
 $RunScript = Join-Path $ProjectRoot 'run_level.py'
-$LogFile = Join-Path $ProjectRoot '_debug\logs\bbma.log'
-$ConsoleLog = Join-Path $ProjectRoot '_debug\logs\launcher_console.log'
-$OutputDir = Join-Path $ProjectRoot 'outputs'
+$LogFile = Join-Path $DataRoot '_debug\logs\bbma.log'
+$ConsoleLog = Join-Path $DataRoot '_debug\logs\launcher_console.log'
+$OutputDir = Join-Path $DataRoot 'outputs'
 $script:AutomationProcess = $null
 $script:LastConsoleText = ''
+$script:LogDisplayStart = 0
 
 function Resolve-PythonCommand {
     $venvPython = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
@@ -26,12 +29,70 @@ function Resolve-PythonCommand {
     return $null
 }
 
+function Resolve-RunnerCommand {
+    if ($BundledRunner -and (Test-Path -LiteralPath $BundledRunner)) {
+        return @{ FileName = $BundledRunner; Prefix = ''; Bundled = $true }
+    }
+    $python = Resolve-PythonCommand
+    if ($null -eq $python) {
+        return $null
+    }
+    return @{ FileName = $python.FileName; Prefix = $python.Prefix; Bundled = $false }
+}
+
+function Set-RoundedButtonRegion {
+    param(
+        [System.Windows.Forms.Button]$Button,
+        [int]$Radius = 10
+    )
+    if ($Button.Width -le 0 -or $Button.Height -le 0) {
+        return
+    }
+
+    $diameter = [Math]::Min($Radius * 2, [Math]::Min($Button.Width, $Button.Height))
+    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $path.AddArc(0, 0, $diameter, $diameter, 180, 90)
+    $path.AddArc($Button.Width - $diameter - 1, 0, $diameter, $diameter, 270, 90)
+    $path.AddArc($Button.Width - $diameter - 1, $Button.Height - $diameter - 1, $diameter, $diameter, 0, 90)
+    $path.AddArc(0, $Button.Height - $diameter - 1, $diameter, $diameter, 90, 90)
+    $path.CloseFigure()
+
+    $oldRegion = $Button.Region
+    $Button.Region = New-Object System.Drawing.Region($path)
+    if ($null -ne $oldRegion) {
+        $oldRegion.Dispose()
+    }
+    $path.Dispose()
+}
+
+function Initialize-ActionButton {
+    param(
+        [System.Windows.Forms.Button]$Button,
+        [System.Drawing.Color]$BackColor,
+        [System.Drawing.Color]$ForeColor
+    )
+    $Button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $Button.FlatAppearance.BorderSize = 0
+    $Button.UseVisualStyleBackColor = $false
+    $Button.BackColor = $BackColor
+    $Button.ForeColor = $ForeColor
+    $Button.Cursor = [System.Windows.Forms.Cursors]::Hand
+    Set-RoundedButtonRegion -Button $Button -Radius 10
+}
+
 function Read-LauncherLog {
     if (-not (Test-Path -LiteralPath $ConsoleLog)) {
         return ''
     }
     try {
         $text = [System.IO.File]::ReadAllText($ConsoleLog, [System.Text.Encoding]::UTF8)
+        if ($script:LogDisplayStart -gt 0) {
+            if ($text.Length -ge $script:LogDisplayStart) {
+                $text = $text.Substring($script:LogDisplayStart)
+            } else {
+                $script:LogDisplayStart = 0
+            }
+        }
         $ansiPattern = [char]27 + '\[[0-9;?]*[ -/]*[@-~]'
         $text = [System.Text.RegularExpressions.Regex]::Replace($text, $ansiPattern, '')
         $text = $text -replace "`r(?!`n)", "`r`n"
@@ -82,24 +143,31 @@ $form.Controls.Add($levelBox)
 
 $startButton = New-Object System.Windows.Forms.Button
 $startButton.Text = '开始运行'
-$startButton.Location = New-Object System.Drawing.Point(250, 103)
-$startButton.Size = New-Object System.Drawing.Size(130, 38)
-$startButton.BackColor = [System.Drawing.Color]::FromArgb(38, 132, 255)
-$startButton.ForeColor = [System.Drawing.Color]::White
-$startButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$startButton.Location = New-Object System.Drawing.Point(244, 103)
+$startButton.Size = New-Object System.Drawing.Size(116, 38)
+Initialize-ActionButton -Button $startButton -BackColor ([System.Drawing.Color]::FromArgb(38, 132, 255)) -ForeColor ([System.Drawing.Color]::White)
 $form.Controls.Add($startButton)
 
 $logButton = New-Object System.Windows.Forms.Button
 $logButton.Text = '打开日志文件'
-$logButton.Location = New-Object System.Drawing.Point(396, 103)
-$logButton.Size = New-Object System.Drawing.Size(130, 38)
+$logButton.Location = New-Object System.Drawing.Point(374, 103)
+$logButton.Size = New-Object System.Drawing.Size(116, 38)
+Initialize-ActionButton -Button $logButton -BackColor ([System.Drawing.Color]::White) -ForeColor ([System.Drawing.Color]::FromArgb(31, 41, 55))
 $form.Controls.Add($logButton)
 
 $outputButton = New-Object System.Windows.Forms.Button
 $outputButton.Text = '打开结果目录'
-$outputButton.Location = New-Object System.Drawing.Point(542, 103)
-$outputButton.Size = New-Object System.Drawing.Size(130, 38)
+$outputButton.Location = New-Object System.Drawing.Point(504, 103)
+$outputButton.Size = New-Object System.Drawing.Size(116, 38)
+Initialize-ActionButton -Button $outputButton -BackColor ([System.Drawing.Color]::White) -ForeColor ([System.Drawing.Color]::FromArgb(31, 41, 55))
 $form.Controls.Add($outputButton)
+
+$clearLogButton = New-Object System.Windows.Forms.Button
+$clearLogButton.Text = '清空日志'
+$clearLogButton.Location = New-Object System.Drawing.Point(634, 103)
+$clearLogButton.Size = New-Object System.Drawing.Size(116, 38)
+Initialize-ActionButton -Button $clearLogButton -BackColor ([System.Drawing.Color]::FromArgb(229, 231, 235)) -ForeColor ([System.Drawing.Color]::FromArgb(55, 65, 81))
+$form.Controls.Add($clearLogButton)
 
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Text = '状态：等待启动'
@@ -127,13 +195,16 @@ $startButton.Add_Click({
         [System.Windows.Forms.MessageBox]::Show('当前已有任务正在运行。', '提示')
         return
     }
-    if (-not (Test-Path -LiteralPath $RunScript)) {
-        [System.Windows.Forms.MessageBox]::Show("找不到运行入口：$RunScript", '启动失败')
+    $runner = Resolve-RunnerCommand
+    if ($null -eq $runner) {
+        [System.Windows.Forms.MessageBox]::Show(
+            '未找到内置运行器或 Python。请重新下载完整的免安装版 EXE。',
+            '启动失败'
+        )
         return
     }
-    $python = Resolve-PythonCommand
-    if ($null -eq $python) {
-        [System.Windows.Forms.MessageBox]::Show('未找到 Python，请先创建 .venv 或安装 Python 3。', '启动失败')
+    if (-not $runner.Bundled -and -not (Test-Path -LiteralPath $RunScript)) {
+        [System.Windows.Forms.MessageBox]::Show("找不到运行入口：$RunScript", '启动失败')
         return
     }
 
@@ -144,11 +215,17 @@ $startButton.Add_Click({
     }
     [System.IO.File]::WriteAllText($ConsoleLog, '', [System.Text.UTF8Encoding]::new($false))
     $script:LastConsoleText = ''
+    $script:LogDisplayStart = 0
+    $logBox.Text = '正在启动，请稍候……'
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $python.FileName
-    $psi.Arguments = "$($python.Prefix)-u `"$RunScript`" --level $level --console-log `"$ConsoleLog`""
-    $psi.WorkingDirectory = $ProjectRoot
+    $psi.FileName = $runner.FileName
+    if ($runner.Bundled) {
+        $psi.Arguments = "--level $level --console-log `"$ConsoleLog`""
+    } else {
+        $psi.Arguments = "$($runner.Prefix)-u `"$RunScript`" --level $level --console-log `"$ConsoleLog`""
+    }
+    $psi.WorkingDirectory = $DataRoot
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
@@ -180,6 +257,43 @@ $outputButton.Add_Click({
         New-Item -ItemType Directory -Path $OutputDir | Out-Null
     }
     Start-Process -FilePath 'explorer.exe' -ArgumentList $OutputDir
+})
+
+$clearLogButton.Add_Click({
+    $isRunning = $null -ne $script:AutomationProcess -and -not $script:AutomationProcess.HasExited
+    if ($isRunning) {
+        try {
+            if (Test-Path -LiteralPath $ConsoleLog) {
+                $script:LogDisplayStart = [System.IO.File]::ReadAllText(
+                    $ConsoleLog,
+                    [System.Text.Encoding]::UTF8
+                ).Length
+            }
+        } catch {
+            $script:LogDisplayStart = 0
+        }
+        $statusLabel.Text = '状态：已清空当前显示，任务继续运行'
+    } else {
+        foreach ($path in @($ConsoleLog, $LogFile)) {
+            try {
+                $parent = Split-Path -Parent $path
+                if (-not (Test-Path -LiteralPath $parent)) {
+                    New-Item -ItemType Directory -Path $parent | Out-Null
+                }
+                [System.IO.File]::WriteAllText($path, '', [System.Text.UTF8Encoding]::new($false))
+            } catch {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "无法清空日志：$path`n$($_.Exception.Message)",
+                    '清空失败'
+                )
+                return
+            }
+        }
+        $script:LogDisplayStart = 0
+        $statusLabel.Text = '状态：日志已清空'
+    }
+    $script:LastConsoleText = ''
+    $logBox.Text = '日志已清空。'
 })
 
 $timer = New-Object System.Windows.Forms.Timer

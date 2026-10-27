@@ -1,4 +1,6 @@
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from time import sleep
@@ -6,11 +8,70 @@ from time import sleep
 import cv2
 import numpy as np
 
-from config import ADB_SERIAL, DEFAULT_SCREENSHOT_NAME, SCREENSHOT_DIR
+from config import ADB_SERIAL, BASE_DIR, DEFAULT_SCREENSHOT_NAME, RESOURCE_DIR, SCREENSHOT_DIR
 from utils.logger import get_logger
 
 
 logger = get_logger(__name__)
+
+
+def resolve_adb_executable() -> str:
+    """查找可用的 adb，兼容未把模拟器 ADB 加入 PATH 的 Windows 环境。"""
+    configured = os.environ.get("ADB_PATH", "").strip().strip('"')
+    if configured:
+        configured_path = Path(os.path.expandvars(configured)).expanduser()
+        if configured_path.is_file():
+            return str(configured_path)
+        resolved = shutil.which(configured)
+        if resolved:
+            return resolved
+        raise FileNotFoundError(
+            f"ADB_PATH 指向的文件不存在：{configured}。请把它设置为 adb.exe 的完整路径。"
+        )
+
+    resolved = shutil.which("adb")
+    if resolved:
+        return resolved
+
+    candidates = [
+        RESOURCE_DIR / "platform-tools" / "adb.exe",
+        BASE_DIR / "platform-tools" / "adb.exe",
+    ]
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.append(Path(local_app_data) / "Android" / "Sdk" / "platform-tools" / "adb.exe")
+
+    program_files = [
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramFiles(x86)"),
+    ]
+    for root in filter(None, program_files):
+        candidates.extend(
+            [
+                Path(root) / "LDPlayer" / "LDPlayer9" / "adb.exe",
+                Path(root) / "Netease" / "MuMuPlayer-12.0" / "shell" / "adb.exe",
+                Path(root) / "Netease" / "MuMuPlayerGlobal-12.0" / "shell" / "adb.exe",
+            ]
+        )
+
+    for drive in ("C", "D", "E", "F"):
+        root = Path(f"{drive}:/")
+        candidates.extend(
+            [
+                root / "leidian" / "LDPlayer9" / "adb.exe",
+                root / "LDPlayer" / "LDPlayer9" / "adb.exe",
+                root / "software" / "LDPlayer" / "LDPlayer9" / "adb.exe",
+                root / "Android" / "platform-tools" / "adb.exe",
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+
+    raise FileNotFoundError(
+        "未找到 adb.exe。请启动安卓模拟器，或设置环境变量 ADB_PATH 为 adb.exe 的完整路径。"
+    )
 
 
 class AdbCommandError(RuntimeError):
@@ -25,8 +86,14 @@ class AdbCommandError(RuntimeError):
 
 class AdbController:
 
-    def __init__(self, serial: str = ADB_SERIAL, auto_connect: bool = True):
+    def __init__(
+        self,
+        serial: str = ADB_SERIAL,
+        auto_connect: bool = True,
+        adb_executable: str | None = None,
+    ):
         self.serial = serial
+        self.adb_executable = adb_executable or resolve_adb_executable()
         self._touch_device_info: tuple[str, int, int, int, int] | None = None
         self._next_touch_tracking_id = 100
         self._root_shell_ready = False
@@ -36,7 +103,7 @@ class AdbController:
         self._reject_network_enabled_uids: set[int] = set()
         if auto_connect:
             self.connect()
-        logger.info("adb 控制器已初始化: %s", self.serial)
+        logger.info("adb 控制器已初始化: %s (%s)", self.serial, self.adb_executable)
 
     def _run(self, args: list[str], *, device: bool = True, check: bool = True) -> subprocess.CompletedProcess[str]:
         ''' 执行 adb 命令，自动添加设备参数。 '''
@@ -101,7 +168,7 @@ class AdbController:
         return result
 
     def _build_command(self, args: list[str], *, device: bool) -> list[str]:
-        command = ["adb"]
+        command = [self.adb_executable]
         if device:
             command.extend(["-s", self.serial])
         command.extend(args)
@@ -492,7 +559,7 @@ class AdbController:
         """恢复异常的 adb 连接，并清理依赖设备状态的缓存。"""
         self._touch_device_info = None
         self._root_shell_ready = False
-        disconnect_command = ["adb", "disconnect", self.serial]
+        disconnect_command = [self.adb_executable, "disconnect", self.serial]
         logger.info("断开 adb 设备连接: %s", self.serial)
         subprocess.run(disconnect_command, capture_output=True, text=True, errors="replace")
         sleep(0.5)

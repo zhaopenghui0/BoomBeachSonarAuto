@@ -1,4 +1,6 @@
 import logging
+import os
+import sys
 
 from config import LOG_FILE, LOG_LEVEL
 
@@ -51,7 +53,13 @@ def setup_logging(level: str | int | None = None) -> None:
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    console_formatter = ColorFormatter(datefmt="%H:%M:%S")
+    if sys.stderr.isatty() and not os.environ.get("NO_COLOR"):
+        console_formatter = ColorFormatter(datefmt="%H:%M:%S")
+    else:
+        console_formatter = logging.Formatter(
+            "%(asctime)s %(levelname)-8s %(name)s | %(message)s",
+            datefmt="%H:%M:%S",
+        )
 
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)

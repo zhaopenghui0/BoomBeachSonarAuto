@@ -1,8 +1,18 @@
+import os
+import sys
 from pathlib import Path
 from typing import Final
 
-# Base 路径，指向项目根目录
-BASE_DIR = Path(__file__).resolve().parent
+# 单文件版本的只读资源位于 PyInstaller 临时目录，运行日志和结果仍写到 EXE 所在目录。
+SOURCE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    RESOURCE_DIR = Path(getattr(sys, "_MEIPASS"))
+    BASE_DIR = Path(
+        os.environ.get("BBMA_DATA_DIR", Path(sys.executable).resolve().parent)
+    ).resolve()
+else:
+    RESOURCE_DIR = SOURCE_DIR
+    BASE_DIR = SOURCE_DIR
 
 # ADB 连接的默认设备 IP 地址
 ADB_SERIAL = "127.0.0.1:5555"
@@ -11,7 +21,7 @@ ADB_SERIAL = "127.0.0.1:5555"
 GAME_PACKAGE_NAME = "com.tencent.tmgp.supercell.boombeach"
 
 # 模板图片目录和截图保存目录
-TEMPLATE_DIR = BASE_DIR / "template"
+TEMPLATE_DIR = RESOURCE_DIR / "template"
 SCREENSHOT_DIR = BASE_DIR / "_debug" / "screenshots"
 LOG_DIR = BASE_DIR / "_debug" / "logs"
 LOG_FILE = LOG_DIR / "bbma.log"
@@ -69,7 +79,7 @@ SUBMARINES: Final[dict[int, tuple[int, ...]]] = {
 
 # 是否优先使用人工校准后的固定点位
 USE_SAVED_POINTS = True
-SAVED_POINTS_FILE = BASE_DIR / "save_points" / "points.json"
+SAVED_POINTS_FILE = RESOURCE_DIR / "save_points" / "points.json"
 
 # 默认的截图文件名和模板匹配的默认阈值
 DEFAULT_SCREENSHOT_NAME = "screen.png"
